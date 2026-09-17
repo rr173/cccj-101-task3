@@ -78,7 +78,8 @@ make smoke    # 端到端：起服务→分类→冻结→重启→损坏→隔�
 | `GET /v1/devices/{id}/events?from_seq=&from_offset=&limit=` | 单设备**业务序**查询，返回 `events/gaps/next` 游标 |
 | `GET /v1/segments` | 分段清单（状态、offset 区间、sha256）+ 开放段信息 |
 | `GET /v1/segments/{id}/events?from_offset=&limit=` | 段内扫描（逐帧 CRC 校验） |
-| `POST /v1/segments/{id}/rebuild` | 从保留的 WAL 重建被隔离段 |
+| `POST /v1/segments/{id}/rebuild` | 提交**后台重建作业**（`202 + job`）；段未隔离则 `200` 直接返回当前 meta |
+| `GET /v1/jobs` · `GET /v1/jobs/{id}` | 维修作业列表 / 单个作业状态轮询 |
 | `POST /v1/freeze` | 冻结当前视图：封存开放段，返回 `{id, end_offset, segments}` |
 | `GET /v1/freezes` | 冻结列表 |
 | `GET /v1/replay?freeze_id=&from_offset=&device_id=&limit=` | 回放冻结视图（不传 `freeze_id` 则回放到当前头） |
@@ -107,14 +108,30 @@ curl 'localhost:8080/v1/replay?from_offset=<end_offset>'
 - **读时校验**：每次读取逐帧 CRC32；发现损坏立即隔离并持久化。
 - **隔离影响范围**：被隔离段从查询/回放中剔除，响应携带
   `resume_offset = last_offset + 1`——即可继续处理的位置。
-- **修复**：`POST /v1/segments/{id}/rebuild` 从保留的 WAL
-  （默认保留最近 8 个段的覆盖）原样重建；WAL 已超保留期则返回
-  `410 + resume_offset`，调用方可跳过该段继续。
+- **修复**：`POST /v1/segments/{id}/rebuild` 提交一个**后台作业**
+  （`202 + job_id`），用 `GET /v1/jobs/{id}` 轮询结果。作业从保留的 WAL
+  （默认保留最近 8 个段的覆盖）原样重建；WAL 已超保留期则作业以
+  `failed / wal_coverage_gone + resume_offset` 结束，调用方可跳过该段继续。
+  作业与前台流量并发执行，不阻塞摄取、查询与冻结。
 
 ```bash
 curl localhost:8080/v1/segments            # 找到 quarantined 段
-curl -XPOST localhost:8080/v1/segments/seg-…/rebuild
+curl -XPOST localhost:8080/v1/segments/seg-…/rebuild   # 202 + {"job": {...}}
+curl localhost:8080/v1/jobs/job-…          # 轮询直到 done/failed/conflict
 ```
+
+**作业的竞态与故障语义**：
+
+- **版本检测**：计划阶段记录段的内部版本号并钉住所需 WAL 覆盖（防止日志
+  淘汰中途抽走输入）；提交前重新校验版本。若期间该归档单元状态变化
+  （被其他途径重建、再次隔离等），提交被拒绝、暂存文件丢弃，作业置为
+  `conflict`——**不会覆盖无损文件**，按原样重试即可。
+- **安全提交**：重建结果先写入 `seg-….rebuild-*` 暂存目录，提交时在锁内
+  交换目录并原子落盘 manifest；任何失败都回滚到作业前状态。
+- **重启**：服务停止时未提交的作业安全中止（`aborted`），暂存目录在下次
+  启动时被清理，段保持 quarantined，重启后重新提交即可。
+- **不变量**：重建只替换该段的内容与索引，不触碰 `next_offset`、封存水位、
+  冻结视界与消费游标，不产生重复记录，不丢失已确认数据。
 
 ## 持久化与故障语义
 
@@ -153,6 +170,8 @@ $data_dir/
 ## 设计取舍与限制
 
 - 单节点、单写者（进程内锁）；吞吐瓶颈在 fsync 频率，按批聚合。
+- 段重建等维修操作由单个后台 worker 串行执行，与前台流量并发；前台只
+  在计划/提交两个毫秒级临界区持锁，长 I/O 全部在锁外完成。
 - 设备索引与去重表在内存中重建（启动重放段索引 + WAL 尾）；事件量级
   超出内存时需外置索引（当前架构可平滑替换 `DeviceState` 的存储）。
 - 重复判定依赖 `event_id` 全量驻留内存；`seq` 冲突只打标不拒绝（保留现场）。

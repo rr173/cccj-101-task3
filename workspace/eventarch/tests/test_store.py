@@ -4,14 +4,18 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import timedelta
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from eventarch import segments as segmod
 from eventarch.config import Config
 from eventarch.models import fmt_ts, utcnow
-from eventarch.store import ArchiveStore
+from eventarch.store import ArchiveStore, WalCoverageGone
 
 
 def make_cfg(tmp, **kw):
@@ -339,6 +343,202 @@ class CorruptionTest(unittest.TestCase):
         self.assertEqual([e["offset"] for e in rep["events"]], [5, 6, 7, 8, 9])
         self.assertEqual(rep["gaps"][0]["resume_offset"], 5)
         s2.close()
+
+
+class RebuildJobTest(unittest.TestCase):
+    """Background rebuild jobs: concurrency, version races, restart safety."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _make_quarantined(self, **kw):
+        """12 events -> seg-0 [0..4], seg-5 [5..9] (quarantined), 2 open."""
+        s = open_store(self.tmp, **kw)
+        s.ingest([ev("d1", i) for i in range(12)])
+        victim = s.list_segments()["segments"][1]["id"]
+        orig_sha = s.list_segments()["segments"][1]["sha256"]
+        s.quarantine(victim, "simulated corruption")
+        return s, victim, orig_sha
+
+    def _wait_job(self, s, job_id, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            j = s.get_job(job_id)
+            if j["status"] in ("done", "failed", "conflict", "aborted"):
+                return j
+            time.sleep(0.01)
+        self.fail(f"job {job_id} did not finish")
+
+    def test_rebuild_job_restores_segment(self):
+        s, victim, orig_sha = self._make_quarantined()
+        self.addCleanup(s.close)
+        job = s.submit_rebuild(victim)
+        self.assertIsNotNone(job)
+        dup = s.submit_rebuild(victim)  # idempotent while active
+        self.assertEqual(dup["id"], job["id"])
+
+        final = self._wait_job(s, job["id"])
+        self.assertEqual(final["status"], "done")
+        self.assertEqual(final["segment"]["status"], "sealed")
+        self.assertEqual(final["segment"]["sha256"], orig_sha)
+
+        got = s.device_events("d1", limit=100)
+        self.assertEqual([e["event"]["seq"] for e in got["events"]],
+                         list(range(12)))
+        self.assertEqual([e["offset"] for e in got["events"]], list(range(12)))
+        self.assertEqual(got["gaps"], [])
+        # no duplicate device entries after the index refresh
+        self.assertEqual(len(got["events"]), 12)
+        # healthy now: resubmitting is a no-op
+        self.assertIsNone(s.submit_rebuild(victim))
+
+    def test_foreground_traffic_runs_during_rebuild(self):
+        s, victim, _ = self._make_quarantined()
+        self.addCleanup(s.close)
+        entered = threading.Event()
+        release = threading.Event()
+        orig_stage = ArchiveStore._stage_rebuild
+
+        def slow_stage(self_, plan, records):
+            entered.set()  # job is mid-flight, holding no lock
+            self.assertTrue(release.wait(10))
+            return orig_stage(self_, plan, records)
+
+        with mock.patch.object(ArchiveStore, "_stage_rebuild", slow_stage):
+            job = s.submit_rebuild(victim)
+            self.assertTrue(entered.wait(10))
+            t0 = time.monotonic()
+            # ingest, query and freeze must all proceed while the job runs
+            r = s.ingest([ev("d2", i) for i in range(3)])
+            self.assertTrue(all(x["status"] == "stored" for x in r))
+            self.assertEqual([x["offset"] for x in r], [12, 13, 14])
+            got = s.device_events("d1", limit=100)  # serves around the gap
+            self.assertEqual(got["gaps"][0]["resume_offset"], 10)
+            frz = s.freeze(note="during rebuild")
+            self.assertEqual(frz["end_offset"], 15)
+            self.assertLess(time.monotonic() - t0, 5)
+            release.set()
+
+        final = self._wait_job(s, job["id"])
+        self.assertEqual(final["status"], "done")
+        # the rebuild moved neither cursors nor the snapshot horizon
+        self.assertEqual(s.stats()["next_offset"], 15)
+        self.assertEqual(s.list_segments()["sealed_through"], 14)
+        rep = s.replay(freeze_id=frz["id"], limit=100)
+        self.assertEqual(rep["end_offset"], 15)
+        self.assertEqual([e["offset"] for e in rep["events"]], list(range(15)))
+        got = s.device_events("d1", limit=100)
+        self.assertEqual([e["event"]["seq"] for e in got["events"]],
+                         list(range(12)))
+
+    def test_commit_conflict_when_segment_changes_mid_job(self):
+        s, victim, orig_sha = self._make_quarantined()
+        self.addCleanup(s.close)
+        orig_commit = ArchiveStore._commit_rebuild
+        live_ino = []
+
+        def racing_commit(self_, plan, new_meta, index, staging):
+            # another actor finishes a rebuild of the same segment first
+            found = self_._collect_rebuild_records(plan)
+            recs = [found[o] for o in range(plan["first"], plan["last"] + 1)]
+            other_meta, _ = segmod.write_segment(self_.seg_root, victim, recs)
+            with self_._lock:
+                m = self_._seg_by_id[victim]
+                m.clear()
+                m.update(other_meta)
+                self_._persist_manifest()
+                self_._bump_seg_version(victim)
+            live_ino.append(os.stat(
+                segmod.events_path(self_.seg_root, victim)).st_ino)
+            return orig_commit(self_, plan, new_meta, index, staging)
+
+        with mock.patch.object(ArchiveStore, "_commit_rebuild", racing_commit):
+            job = s.submit_rebuild(victim)
+            final = self._wait_job(s, job["id"])
+
+        self.assertEqual(final["status"], "conflict")
+        self.assertEqual(final["error_type"], "conflict")
+        # the intact segment was NOT overwritten by the losing job
+        after = s.get_segment(victim)
+        self.assertEqual(after["status"], "sealed")
+        self.assertEqual(after["sha256"], orig_sha)
+        ok, reason = segmod.verify(s.seg_root, after)
+        self.assertTrue(ok, reason)
+        self.assertEqual(
+            os.stat(segmod.events_path(s.seg_root, victim)).st_ino,
+            live_ino[0])
+        # staged/replaced leftovers are cleaned up
+        leftovers = [n for n in os.listdir(s.seg_root)
+                     if "rebuild-" in n or "replaced-" in n]
+        self.assertEqual(leftovers, [])
+        # device view complete, no duplicates
+        got = s.device_events("d1", limit=100)
+        self.assertEqual([e["offset"] for e in got["events"]], list(range(12)))
+        # retry after the race is a no-op (segment healthy now)
+        self.assertIsNone(s.submit_rebuild(victim))
+
+    def test_wal_eviction_race_is_detected(self):
+        s = open_store(self.tmp, wal_retain_segments=1)
+        self.addCleanup(s.close)
+        s.ingest([ev("d1", i) for i in range(5)])      # segment A
+        s.ingest([ev("d1", i) for i in range(5, 10)])  # segment B; A's WAL gone
+        first = s.list_segments()["segments"][0]["id"]
+        s.quarantine(first, "test")
+
+        job = s.submit_rebuild(first)
+        final = self._wait_job(s, job["id"])
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["error_type"], "wal_coverage_gone")
+        self.assertEqual(final["resume_offset"], 5)
+        # the segment stays quarantined; nothing was written over it
+        self.assertEqual(s.get_segment(first)["status"], "quarantined")
+        # the synchronous facade surfaces the same failure
+        with self.assertRaises(WalCoverageGone) as ctx:
+            s.rebuild_segment(first)
+        self.assertEqual(ctx.exception.resume_offset, 5)
+
+    def test_restart_cleans_stale_staging_dirs(self):
+        s, victim, _ = self._make_quarantined()
+        s.close()  # do not addCleanup: closed here, s2 takes over
+        # leftovers of a rebuild that was interrupted by a restart
+        seg_root = os.path.join(self.tmp, "segments")
+        os.makedirs(os.path.join(seg_root, victim + ".rebuild-deadbeef"))
+        os.makedirs(os.path.join(seg_root, victim + ".replaced-deadbeef"))
+
+        s2 = open_store(self.tmp)
+        self.addCleanup(s2.close)
+        names = os.listdir(seg_root)
+        self.assertFalse(any("rebuild-" in n or "replaced-" in n
+                             for n in names))
+        # the interrupted job changed nothing: still quarantined, retryable
+        meta = [m for m in s2.list_segments()["segments"]
+                if m["id"] == victim][0]
+        self.assertEqual(meta["status"], "quarantined")
+        final = self._wait_job(s2, s2.submit_rebuild(victim)["id"])
+        self.assertEqual(final["status"], "done")
+        got = s2.device_events("d1", limit=100)
+        self.assertEqual([e["event"]["seq"] for e in got["events"]],
+                         list(range(12)))
+
+    def test_stale_quarantine_report_does_not_clobber_rebuilt_segment(self):
+        """A read planned before a rebuild must not quarantine the healthy
+        segment afterwards (version-checked quarantine reports)."""
+        s = open_store(self.tmp)
+        self.addCleanup(s.close)
+        s.ingest([ev("d1", i) for i in range(5)])  # sealed segment [0..4]
+        seg = s.list_segments()["segments"][0]["id"]
+        version_before = s._seg_versions.get(seg, 0)
+        s.quarantine(seg, "corruption found by a reader")
+        final = self._wait_job(s, s.submit_rebuild(seg)["id"])
+        self.assertEqual(final["status"], "done")
+        # a stale report (based on the pre-rebuild version) is ignored
+        s.quarantine(seg, "stale report", expect_version=version_before)
+        self.assertEqual(s.get_segment(seg)["status"], "sealed")
+        # a fresh report (current version) still quarantines
+        s.quarantine(seg, "fresh corruption",
+                     expect_version=s._seg_versions.get(seg, 0))
+        self.assertEqual(s.get_segment(seg)["status"], "quarantined")
 
 
 if __name__ == "__main__":

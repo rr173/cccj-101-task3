@@ -42,13 +42,16 @@ def events_path(seg_root: str, seg_id: str) -> str:
     return os.path.join(seg_dir(seg_root, seg_id), "events.log")
 
 
-def write_segment(seg_root: str, seg_id: str, records: List[dict]) -> Tuple[dict, dict]:
+def write_segment(seg_root: str, seg_id: str, records: List[dict],
+                  dir_name: Optional[str] = None) -> Tuple[dict, dict]:
     """Write events.log + index.json + meta.json atomically-ish (fsynced).
 
-    Returns (meta, index).  The segment becomes visible only when the caller
-    commits it to the manifest afterwards.
+    `dir_name` overrides the directory name so a rebuild can be staged next
+    to the live segment and swapped in later; the metadata always carries
+    the real `seg_id`.  Returns (meta, index).  The segment becomes visible
+    only when the caller commits it to the manifest afterwards.
     """
-    d = seg_dir(seg_root, seg_id)
+    d = seg_dir(seg_root, dir_name or seg_id)
     os.makedirs(d, exist_ok=True)
 
     sha = hashlib.sha256()

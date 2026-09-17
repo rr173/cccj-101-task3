@@ -46,8 +46,12 @@ def req(method, path, body=None):
 
 
 def req_status(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(BASE + path, data=data, method=method,
+                               headers={"Content-Type": "application/json"})
     try:
-        return req(method, path, body), 200
+        with urllib.request.urlopen(r) as resp:
+            return json.loads(resp.read()), resp.status
     except urllib.error.HTTPError as e:
         return json.loads(e.read()), e.code
 
@@ -179,9 +183,24 @@ def main():
         check("replay marks gap and continues past it",
               len(rep3["gaps"]) == 1 and rep3["gaps"][0]["resume_offset"] == 5)
 
-        print("== 7. rebuild from retained WAL ==")
-        r = req("POST", f"/v1/segments/{victim}/rebuild")
-        check("segment rebuilt", r["segment"]["status"] == "sealed")
+        print("== 7. rebuild from retained WAL (background job) ==")
+        body, code = req_status("POST", f"/v1/segments/{victim}/rebuild")
+        check("rebuild accepted as background job",
+              code == 202 and body.get("job", {}).get("status") in ("queued", "running"),
+              f"code={code} body={body}")
+        job_id = body["job"]["id"]
+        final = None
+        for _ in range(100):
+            final = req("GET", f"/v1/jobs/{job_id}")["job"]
+            if final["status"] in ("done", "failed", "conflict", "aborted"):
+                break
+            time.sleep(0.1)
+        check("rebuild job finished successfully", final["status"] == "done",
+              f"status={final['status']} error={final.get('error')}")
+        check("segment rebuilt", final["segment"]["status"] == "sealed")
+        body, code = req_status("POST", f"/v1/segments/{victim}/rebuild")
+        check("rebuild of a healthy segment is a no-op",
+              code == 200 and body["segment"]["status"] == "sealed")
         got = req("GET", "/v1/devices/dev-A/events?limit=100")
         check("device view fully restored",
               [e["event"]["seq"] for e in got["events"]] == list(range(1, 13)))

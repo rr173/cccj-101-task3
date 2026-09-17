@@ -126,7 +126,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "POST" and len(parts) == 4 and parts[:2] == ["v1", "segments"] \
                 and parts[3] == "rebuild":
-            return self._send_json({"segment": s.rebuild_segment(parts[2])})
+            job = s.submit_rebuild(parts[2])
+            if job is None:  # not quarantined: nothing to do
+                return self._send_json({"segment": s.get_segment(parts[2])})
+            return self._send_json({"job": job}, status=202)
+
+        if method == "GET" and parts == ["v1", "jobs"]:
+            return self._send_json({"jobs": s.list_jobs()})
+
+        if method == "GET" and len(parts) == 3 and parts[:2] == ["v1", "jobs"]:
+            return self._send_json({"job": s.get_job(parts[2])})
 
         if method == "POST" and parts == ["v1", "freeze"]:
             body = self._body_json()

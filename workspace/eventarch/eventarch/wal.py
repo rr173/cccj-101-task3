@@ -85,10 +85,6 @@ def truncate(path: str, pos: int) -> None:
         os.fsync(fh.fileno())
 
 
-def read_all_payloads(path: str) -> List[bytes]:
-    return [payload for _, payload in iter_frames(path)]
-
-
 def last_offset(path: str) -> Optional[int]:
     """Offset of the newest record in a WAL file, or None if it is empty.
 

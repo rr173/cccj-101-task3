@@ -6,6 +6,17 @@ A single RLock guards all in-memory state and WAL appends.  Read paths that
 touch immutable segment files build a plan under the lock, then perform file
 I/O *outside* the lock so that long replays never block ingestion.
 
+Segment rebuilds (maintenance) run as background jobs on a single worker
+thread, concurrent with foreground traffic.  A job only takes the lock for
+two short critical sections — planning (capturing a per-segment version and
+pinning WAL coverage against retention) and committing (re-checking the
+version, swapping the staged segment directory in, and updating indexes).
+All heavy I/O (WAL scans, segment writes, fsyncs) happens lock-free.  If
+the segment's version changed mid-flight the commit is refused and the
+staged files are discarded, so a rebuild can never overwrite an intact
+segment; if the service stops, the job aborts before touching live state
+and can simply be retried after restart.
+
 Durability
 ----------
 Every ingest batch is appended to the WAL and fsync'd before the ACK is
@@ -22,6 +33,7 @@ import bisect
 import json
 import logging
 import os
+import queue
 import shutil
 import threading
 import time
@@ -55,6 +67,28 @@ class WalCoverageGone(Exception):
         super().__init__(f"WAL coverage for {seg_id} is no longer retained")
         self.seg_id = seg_id
         self.resume_offset = resume_offset
+
+
+class RebuildConflict(Exception):
+    """The segment's state version changed while a rebuild job was running."""
+
+    def __init__(self, seg_id: str):
+        super().__init__(
+            f"segment {seg_id} changed while the rebuild was in flight; retry")
+        self.seg_id = seg_id
+
+
+class JobAborted(Exception):
+    """A background job was stopped before committing (e.g. shutdown)."""
+
+
+JOB_QUEUED = "queued"
+JOB_RUNNING = "running"
+JOB_DONE = "done"
+JOB_FAILED = "failed"
+JOB_CONFLICT = "conflict"     # version race lost; safe to retry
+JOB_ABORTED = "aborted"       # stopped by shutdown; safe to retry
+JOB_TERMINAL = (JOB_DONE, JOB_FAILED, JOB_CONFLICT, JOB_ABORTED)
 
 
 class Entry:
@@ -115,6 +149,15 @@ class ArchiveStore:
         self._started_at = time.monotonic()
         self._janitor_stop = threading.Event()
         self._janitor: Optional[threading.Thread] = None
+        # maintenance (rebuild) machinery
+        self._seg_versions: Dict[str, int] = {}  # bumped on every status change
+        self._wal_pins: Dict[str, Tuple[int, int]] = {}  # seg_id -> offset range
+        self._jobs: Dict[str, dict] = {}
+        self._job_events: Dict[str, threading.Event] = {}
+        self._active_jobs: Dict[str, str] = {}  # seg_id -> job_id
+        self._job_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._job_stop = threading.Event()
+        self._worker: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------ #
     # recovery                                                            #
@@ -390,7 +433,9 @@ class ArchiveStore:
         """Retention horizon: WAL files with base offset below this may go.
 
         Keeps the last `wal_retain_segments` sealed segments plus anything
-        backing a quarantined segment (needed for rebuild)."""
+        backing a quarantined segment (needed for rebuild) plus any range
+        pinned by an in-flight rebuild job (its coverage must survive even
+        if the segment's status flips while the job is running)."""
         sealed = sorted(
             (m for m in self.manifest["segments"] if m["status"] == "sealed"),
             key=lambda m: m["first_offset"])
@@ -401,6 +446,8 @@ class ArchiveStore:
                        if m["status"] == "quarantined"]
         if quarantined:
             keep_from = min(keep_from, min(quarantined))
+        for first, _last in self._wal_pins.values():
+            keep_from = min(keep_from, first)
         return keep_from
 
     def _collect_wal(self) -> None:
@@ -479,6 +526,10 @@ class ArchiveStore:
                 metas = [dict(m) for m in self.manifest["segments"]]
                 end_offset = self._next_offset
                 open_snapshot = list(self._open_records)
+            # versions at plan time: a corruption report based on this plan
+            # must not quarantine a segment that was rebuilt since
+            versions = {m["id"]: self._seg_versions.get(m["id"], 0)
+                        for m in metas}
 
         events: List[dict] = []
         gaps: List[dict] = []
@@ -505,7 +556,8 @@ class ArchiveStore:
             try:
                 recs, _ = segmod.scan_records(self.seg_root, meta, from_offset)
             except segmod.SegmentCorrupt as c:
-                self.quarantine(meta["id"], c.reason)
+                self.quarantine(meta["id"], c.reason,
+                                expect_version=versions[meta["id"]])
                 gaps.append({"segment": meta["id"], "reason": c.reason,
                              "resume_offset": c.resume_offset})
                 scanned_through = max(scanned_through, meta["last_offset"])
@@ -584,7 +636,8 @@ class ArchiveStore:
                             "resume_offset": meta["last_offset"] + 1,
                         })
                     continue
-                plan.append(("seg", e.seg_id, e.pos, e.length))
+                plan.append(("seg", e.seg_id, e.pos, e.length,
+                             self._seg_versions.get(e.seg_id, 0)))
 
         # I/O outside the lock; segment files are immutable once sealed.
         events: List[dict] = []
@@ -594,7 +647,7 @@ class ArchiveStore:
                 if item[0] == "mem":
                     events.append(item[1])
                     continue
-                _, seg_id, pos, length = item
+                _, seg_id, pos, length, version = item
                 fh = handles.get(seg_id)
                 if fh is None:
                     fh = open(segmod.events_path(self.seg_root, seg_id), "rb")
@@ -605,7 +658,7 @@ class ArchiveStore:
                 except segmod.SegmentCorrupt as c:
                     meta = self._seg_by_id.get(seg_id)
                     resume = (meta["last_offset"] + 1) if meta else 0
-                    self.quarantine(seg_id, c.reason)
+                    self.quarantine(seg_id, c.reason, expect_version=version)
                     gaps.append({"segment": seg_id, "reason": c.reason,
                                  "resume_offset": resume})
         finally:
@@ -634,13 +687,14 @@ class ArchiveStore:
             if meta is None:
                 raise NotFound(f"segment {seg_id} not found")
             meta = dict(meta)
+            version = self._seg_versions.get(seg_id, 0)
         if meta["status"] == "quarantined":
             raise Quarantined(seg_id, meta["last_offset"] + 1,
                               meta.get("quarantine_reason", ""))
         try:
             recs, complete = segmod.scan_records(self.seg_root, meta, from_offset, limit)
         except segmod.SegmentCorrupt as c:
-            self.quarantine(seg_id, c.reason)
+            self.quarantine(seg_id, c.reason, expect_version=version)
             raise Quarantined(seg_id, c.resume_offset, c.reason)
         return {"segment": meta, "events": recs, "complete": complete}
 
@@ -648,15 +702,28 @@ class ArchiveStore:
     # corruption handling                                                 #
     # ------------------------------------------------------------------ #
 
-    def quarantine(self, seg_id: str, reason: str) -> None:
+    def quarantine(self, seg_id: str, reason: str,
+                   expect_version: Optional[int] = None) -> None:
         with self._lock:
             meta = self._seg_by_id.get(seg_id)
             if meta is None or meta["status"] == "quarantined":
                 return
+            if expect_version is not None and \
+                    self._seg_versions.get(seg_id, 0) != expect_version:
+                # the segment changed (e.g. a rebuild committed) after the
+                # caller planned its read: the corruption report is stale
+                log.info("ignoring stale quarantine report for %s", seg_id)
+                return
             self._mark_quarantined(meta, reason)
+            self._bump_seg_version(seg_id)
             self._persist_manifest()
             log.warning("segment %s quarantined: %s (resume at offset %d)",
                         seg_id, reason, meta["last_offset"] + 1)
+
+    def _bump_seg_version(self, seg_id: str) -> None:
+        """Invalidate rebuild plans/quarantine reports made against the
+        previous state of this segment (caller must hold the lock)."""
+        self._seg_versions[seg_id] = self._seg_versions.get(seg_id, 0) + 1
 
     @staticmethod
     def _mark_quarantined(meta: dict, reason: str) -> None:
@@ -664,8 +731,196 @@ class ArchiveStore:
         meta["quarantine_reason"] = reason
         meta["quarantined_at"] = fmt_ts(utcnow())
 
+    # ------------------------------------------------------------------ #
+    # rebuild: background maintenance jobs                                #
+    # ------------------------------------------------------------------ #
+
+    def submit_rebuild(self, seg_id: str) -> Optional[dict]:
+        """Enqueue a background rebuild for a quarantined segment.
+
+        Returns the job descriptor, or None when the segment is not
+        quarantined (nothing to do).  Re-submitting while a job for the
+        same segment is active returns the existing job (idempotent), so
+        duplicate requests can never produce duplicate work.
+        """
+        with self._lock:
+            meta = self._seg_by_id.get(seg_id)
+            if meta is None:
+                raise NotFound(f"segment {seg_id} not found")
+            if meta["status"] != "quarantined":
+                return None
+            active = self._active_jobs.get(seg_id)
+            if active is not None and active in self._jobs:
+                return dict(self._jobs[active])
+            job_id = f"job-{uuid.uuid4().hex[:12]}"
+            job = {
+                "id": job_id,
+                "type": "rebuild",
+                "segment_id": seg_id,
+                "status": JOB_QUEUED,
+                "submitted_at": fmt_ts(utcnow()),
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "error_type": None,
+                "resume_offset": None,
+                "segment": None,
+            }
+            self._jobs[job_id] = job
+            self._job_events[job_id] = threading.Event()
+            self._active_jobs[seg_id] = job_id
+            self._ensure_worker_locked()
+        self._job_queue.put(job_id)
+        return dict(job)
+
+    def get_segment(self, seg_id: str) -> dict:
+        with self._lock:
+            meta = self._seg_by_id.get(seg_id)
+            if meta is None:
+                raise NotFound(f"segment {seg_id} not found")
+            return dict(meta)
+
+    def get_job(self, job_id: str) -> dict:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise NotFound(f"job {job_id} not found")
+            return dict(job)
+
+    def list_jobs(self) -> List[dict]:
+        with self._lock:
+            return [dict(j) for j in self._jobs.values()]
+
     def rebuild_segment(self, seg_id: str) -> dict:
-        """Rebuild a quarantined segment from retained WAL records.
+        """Synchronous rebuild: enqueue a background job and wait for it.
+
+        Kept for in-process callers; the HTTP API exposes the asynchronous
+        job interface.  Raises the same exceptions as before (NotFound,
+        WalCoverageGone).
+        """
+        for _attempt in range(3):
+            job = self.submit_rebuild(seg_id)
+            if job is None:
+                return self.get_segment(seg_id)
+            final = self._wait_for_job(job["id"])
+            if final["status"] == JOB_DONE:
+                return final["segment"]
+            if final["status"] == JOB_FAILED:
+                if final.get("error_type") == "wal_coverage_gone":
+                    raise WalCoverageGone(seg_id, final["resume_offset"])
+                raise RuntimeError(final.get("error") or "rebuild failed")
+            # conflict/aborted: the unit changed under us; re-evaluate
+        raise RuntimeError(
+            f"rebuild of {seg_id} keeps racing concurrent state changes")
+
+    def _wait_for_job(self, job_id: str, timeout: float = 300.0) -> dict:
+        with self._lock:
+            ev = self._job_events.get(job_id)
+        if ev is None or not ev.wait(timeout):
+            raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
+        return self.get_job(job_id)
+
+    def _ensure_worker_locked(self) -> None:
+        if self._worker is None or not self._worker.is_alive():
+            if self._worker is not None:
+                # a stale shutdown sentinel may sit in the old queue
+                self._job_queue = queue.Queue()
+            self._job_stop.clear()
+            self._worker = threading.Thread(
+                target=self._rebuild_worker, name="rebuild-worker", daemon=True)
+            self._worker.start()
+
+    def _rebuild_worker(self) -> None:
+        """Single worker: jobs run one at a time, concurrent with traffic."""
+        while True:
+            job_id = self._job_queue.get()
+            if job_id is None:
+                return  # shutdown sentinel
+            if self._job_stop.is_set():
+                self._finish_job(job_id, JOB_ABORTED,
+                                 error="service is shutting down",
+                                 error_type="aborted")
+                continue
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    continue
+                job["status"] = JOB_RUNNING
+                job["started_at"] = fmt_ts(utcnow())
+                seg_id = job["segment_id"]
+            try:
+                meta = self._execute_rebuild(seg_id)
+            except RebuildConflict as exc:
+                self._finish_job(job_id, JOB_CONFLICT, error=str(exc),
+                                 error_type="conflict")
+            except WalCoverageGone as exc:
+                self._finish_job(job_id, JOB_FAILED, error=str(exc),
+                                 error_type="wal_coverage_gone",
+                                 resume_offset=exc.resume_offset)
+            except JobAborted as exc:
+                self._finish_job(job_id, JOB_ABORTED, error=str(exc),
+                                 error_type="aborted")
+            except NotFound as exc:
+                self._finish_job(job_id, JOB_FAILED, error=str(exc),
+                                 error_type="not_found")
+            except Exception as exc:  # a failing job must not kill the worker
+                log.exception("rebuild job %s failed", job_id)
+                self._finish_job(job_id, JOB_FAILED,
+                                 error=f"internal error: {exc}",
+                                 error_type="internal")
+            else:
+                self._finish_job(job_id, JOB_DONE, segment=meta)
+
+    def _execute_rebuild(self, seg_id: str) -> dict:
+        """Run one rebuild job; only plan/commit hold the lock, I/O does not."""
+        plan = self._plan_rebuild(seg_id)
+        if plan is None:
+            # state changed between submit and run: nothing to do
+            return self.get_segment(seg_id)
+        staging = None
+        try:
+            by_offset = self._collect_rebuild_records(plan)
+            first, last, count = plan["first"], plan["last"], plan["count"]
+            # keys of by_offset are a subset of [first..last], so a full
+            # count means the range is covered contiguously
+            if len(by_offset) != count or len(by_offset) != last - first + 1:
+                raise WalCoverageGone(seg_id, last + 1)
+            records = [by_offset[o] for o in range(first, last + 1)]
+            self._check_job_stop()
+            new_meta, index, staging = self._stage_rebuild(plan, records)
+            self._check_job_stop()
+            return self._commit_rebuild(plan, new_meta, index, staging)
+        finally:
+            if staging is not None:
+                # losing the race or failing must not leave staged files
+                # anywhere near the live segment directory
+                shutil.rmtree(segmod.seg_dir(self.seg_root, staging),
+                              ignore_errors=True)
+            with self._lock:
+                self._wal_pins.pop(seg_id, None)
+
+    def _plan_rebuild(self, seg_id: str) -> Optional[dict]:
+        """Capture the segment's state version and pin its WAL coverage."""
+        with self._lock:
+            meta = self._seg_by_id.get(seg_id)
+            if meta is None:
+                raise NotFound(f"segment {seg_id} not found")
+            if meta["status"] != "quarantined":
+                return None
+            plan = {
+                "seg_id": seg_id,
+                "first": meta["first_offset"],
+                "last": meta["last_offset"],
+                "count": meta["count"],
+                "version": self._seg_versions.get(seg_id, 0),
+            }
+            # keep WAL files covering this range alive for the whole job,
+            # even if retention would otherwise move past them mid-flight
+            self._wal_pins[seg_id] = (plan["first"], plan["last"])
+            return plan
+
+    def _collect_rebuild_records(self, plan: dict) -> Dict[int, dict]:
+        """Read the segment's records from retained WAL files (lock-free).
 
         The records of one segment are not necessarily in the WAL file
         named by its first offset: a batch spanning several seal boundaries
@@ -673,42 +928,105 @@ class ArchiveStore:
         redirects *later* writes.  A file named by base B holds records
         with offset >= B, so collect the segment's range from every
         retained WAL file that may overlap it.
+
+        Files are pinned against retention for the duration of the job (see
+        _plan_rebuild); a file that still disappears, or a tail torn by
+        concurrent appends, only shrinks the collected coverage, which the
+        caller validates before staging anything.
         """
-        with self._lock:
-            meta = self._seg_by_id.get(seg_id)
-            if meta is None:
-                raise NotFound(f"segment {seg_id} not found")
-            if meta["status"] != "quarantined":
-                return dict(meta)
-            first, last = meta["first_offset"], meta["last_offset"]
-            by_offset: Dict[int, dict] = {}
-            for name in sorted(os.listdir(self.wal_dir)):
-                if not name.endswith(".wal"):
-                    continue
-                if int(name[:-4]) > last:
-                    continue  # file starts past the segment's range
-                path = os.path.join(self.wal_dir, name)
-                try:
-                    payloads = walmod.read_all_payloads(path)
-                except Exception as exc:
-                    log.warning("rebuild %s: skipping unreadable WAL file %s: %s",
-                                seg_id, name, exc)
-                    continue
-                for payload in payloads:
+        first, last = plan["first"], plan["last"]
+        by_offset: Dict[int, dict] = {}
+        for name in sorted(os.listdir(self.wal_dir)):
+            if not name.endswith(".wal"):
+                continue
+            if int(name[:-4]) > last:
+                continue  # file starts past the segment's range
+            path = os.path.join(self.wal_dir, name)
+            try:
+                for _pos, payload in walmod.iter_frames(path):
                     rec = json.loads(payload)
                     if first <= rec["offset"] <= last:
                         by_offset.setdefault(rec["offset"], rec)
-            # keys of by_offset are a subset of [first..last], so a full
-            # count means the range is covered contiguously
-            if len(by_offset) != meta["count"] or \
-                    len(by_offset) != last - first + 1:
-                raise WalCoverageGone(seg_id, last + 1)
-            records = [by_offset[o] for o in range(first, last + 1)]
-            new_meta, index = segmod.write_segment(self.seg_root, seg_id, records)
-            meta.clear()
-            meta.update(new_meta)  # status=sealed, fresh sha256
-            self._persist_manifest()
-            # refresh device entries for this segment from the rebuilt index
+            except walmod.TornTail:
+                # concurrent appends can truncate the tail mid-read; the
+                # valid prefix was still collected
+                log.info("rebuild %s: torn tail in %s; using valid prefix",
+                         plan["seg_id"], name)
+            except walmod.FrameCorrupt as c:
+                log.warning("rebuild %s: corrupt frame in %s at byte %d: %s",
+                            plan["seg_id"], name, c.pos, c.reason)
+            except OSError as exc:
+                log.warning("rebuild %s: cannot read WAL file %s: %s",
+                            plan["seg_id"], name, exc)
+        return by_offset
+
+    def _stage_rebuild(self, plan: dict, records: List[dict]):
+        """Write the rebuilt segment to a staging directory (lock-free).
+
+        The live segment directory is only replaced at commit time, after
+        the version check, so an intact segment can never be overwritten;
+        a crash here leaves only a disposable ``*.rebuild-*`` directory
+        that startup cleanup removes.
+        """
+        staging = f"{plan['seg_id']}.rebuild-{uuid.uuid4().hex[:8]}"
+        new_meta, index = segmod.write_segment(
+            self.seg_root, plan["seg_id"], records, dir_name=staging)
+        return new_meta, index, staging
+
+    def _commit_rebuild(self, plan: dict, new_meta: dict, index: dict,
+                        staging: str) -> dict:
+        """Publish a staged rebuild (under the lock, milliseconds).
+
+        The segment's version is re-checked first: if the unit changed
+        while the job was running (rebuilt elsewhere, re-quarantined, ...)
+        the commit is refused and the caller drops the staged files —
+        nothing live is touched.  Otherwise the staged directory is
+        swapped in and the manifest is atomically persisted (the commit
+        point); on any failure the original state is restored.
+        """
+        seg_id = plan["seg_id"]
+        with self._lock:
+            meta = self._seg_by_id.get(seg_id)
+            if (meta is None or meta["status"] != "quarantined"
+                    or self._seg_versions.get(seg_id, 0) != plan["version"]):
+                raise RebuildConflict(seg_id)
+            live = segmod.seg_dir(self.seg_root, seg_id)
+            staging_path = segmod.seg_dir(self.seg_root, staging)
+            trash = segmod.seg_dir(
+                self.seg_root, f"{seg_id}.replaced-{uuid.uuid4().hex[:8]}")
+            old_meta = dict(meta)
+            moved = False   # live dir currently sits at `trash`
+            swapped = False  # staged dir currently sits at `live`
+            try:
+                if os.path.isdir(live):
+                    os.rename(live, trash)
+                    moved = True
+                os.rename(staging_path, live)
+                swapped = True
+                fsync_dir(self.seg_root)
+                meta.clear()
+                meta.update(new_meta)  # status=sealed, fresh sha256
+                self._persist_manifest()  # commit point
+                self._bump_seg_version(seg_id)
+            except Exception:
+                # roll back to the pre-commit state: the manifest on disk
+                # still says quarantined, so restore memory and directories
+                meta.clear()
+                meta.update(old_meta)
+                try:
+                    if swapped:
+                        os.rename(live, staging_path)
+                    if moved:
+                        os.rename(trash, live)
+                    if swapped or moved:
+                        fsync_dir(self.seg_root)
+                except OSError:
+                    log.error("rollback of %s failed; restart heals state",
+                              seg_id)
+                raise
+            # refresh device entries for this segment from the rebuilt index;
+            # entries carry the same (seq, offset) keys, so cursors and
+            # dedup state are unchanged and no duplicates can appear
             for dev_id, d in index["devices"].items():
                 dev = self._devices.setdefault(dev_id, DeviceState())
                 dev.entries = [e for e in dev.entries if e.seg_id != seg_id]
@@ -719,8 +1037,38 @@ class ArchiveStore:
                     dev.event_ids[ie["event_id"]] = ie["offset"]
                     dev.seqs.add(ie["seq"])
                 self._refresh_device_extremes(dev)
-            log.info("segment %s rebuilt from WAL (%d records)", seg_id, len(records))
+            shutil.rmtree(trash, ignore_errors=True)
+            fsync_dir(self.seg_root)
+            log.info("segment %s rebuilt from WAL (%d records)",
+                     seg_id, new_meta["count"])
             return dict(meta)
+
+    def _check_job_stop(self) -> None:
+        if self._job_stop.is_set():
+            raise JobAborted("service is shutting down")
+
+    def _finish_job(self, job_id: str, status: str, **fields) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job["status"] = status
+            job["finished_at"] = fmt_ts(utcnow())
+            job.update(fields)
+            self._active_jobs.pop(job["segment_id"], None)
+            ev = self._job_events.get(job_id)
+            if ev is not None:
+                ev.set()
+            self._prune_jobs_locked()
+            log.info("rebuild job %s (%s) -> %s", job_id, job["segment_id"],
+                     status)
+
+    def _prune_jobs_locked(self, keep: int = 64) -> None:
+        finished = [jid for jid, j in self._jobs.items()
+                    if j["status"] in JOB_TERMINAL]
+        for jid in finished[:max(0, len(finished) - keep)]:
+            self._jobs.pop(jid, None)
+            self._job_events.pop(jid, None)
 
     # ------------------------------------------------------------------ #
     # stats / lifecycle                                                   #
@@ -747,6 +1095,10 @@ class ArchiveStore:
                     "gaps": list(self._wal_gaps),
                 },
                 "freezes": len(self._freezes),
+                "maintenance": {
+                    "jobs_active": len(self._active_jobs),
+                    "jobs_tracked": len(self._jobs),
+                },
                 "config": {
                     "segment_max_records": self.cfg.segment_max_records,
                     "segment_max_age_sec": self.cfg.segment_max_age_sec,
@@ -785,9 +1137,16 @@ class ArchiveStore:
         self._janitor_stop.set()
         if self._janitor:
             self._janitor.join(timeout=5)
+        # stop the rebuild worker; an in-flight job aborts before touching
+        # live state (staged files are cleaned up at next startup)
+        self._job_stop.set()
+        if self._worker is not None:
+            self._job_queue.put(None)  # shutdown sentinel
+            self._worker.join(timeout=10)
         with self._lock:
             if self._wal is not None:
                 self._wal.close()
+                self._wal = None
 
     # ------------------------------------------------------------------ #
     # persistence helpers                                                 #
