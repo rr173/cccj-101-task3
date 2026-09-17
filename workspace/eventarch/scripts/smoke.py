@@ -179,16 +179,45 @@ def main():
         check("replay marks gap and continues past it",
               len(rep3["gaps"]) == 1 and rep3["gaps"][0]["resume_offset"] == 5)
 
-        print("== 7. rebuild from retained WAL ==")
+        print("== 7. rebuild from retained WAL (background job) ==")
         r = req("POST", f"/v1/segments/{victim}/rebuild")
-        check("segment rebuilt", r["segment"]["status"] == "sealed")
+        job = r["job"]
+        check("repair accepted as a background job (202-style async)",
+              job["status"] in ("queued", "running", "succeeded")
+              and job["seg_id"] == victim)
+        # maintenance must not block the foreground: ingest + query while
+        # the repair is (or was just) in flight.
+        r2 = req("POST", "/v1/ingest", {"events": [ev("dev-A", 20, eid="dev-A-e20")]})
+        check("ingest keeps working during repair",
+              r2["results"][0]["status"] == "stored")
+        _ = req("GET", "/v1/devices/dev-A/events?limit=100")
+
+        jid = job["id"]
+        terminal = None
+        for _ in range(200):
+            j = req("GET", f"/v1/repairs/{jid}")["job"]
+            if j["status"] in ("succeeded", "failed"):
+                terminal = j
+                break
+            time.sleep(0.05)
+        check("repair job finished", terminal is not None
+              and terminal["status"] == "succeeded", str(terminal and terminal.get("error")))
+
+        # starting it again on the now-healthy segment is an idempotent no-op
+        again = req("POST", f"/v1/segments/{victim}/rebuild")
+        check("repeat repair on healthy segment is a no-op job",
+              again["job"]["status"] == "succeeded")
+
         got = req("GET", "/v1/devices/dev-A/events?limit=100")
         check("device view fully restored",
-              [e["event"]["seq"] for e in got["events"]] == list(range(1, 13)))
+              [e["event"]["seq"] for e in got["events"]]
+              == list(range(1, 13)) + [20])
 
         stats = req("GET", "/v1/stats")
         check("stats sane", stats["segments"]["quarantined"] == 0
-              and stats["segments"]["sealed"] >= 3)
+              and stats["segments"]["sealed"] >= 3
+              and stats["repairs"]["active"] == 0
+              and stats["repairs"]["succeeded"] >= 2)
     finally:
         stop_server(proc)
         shutil.rmtree(data_dir, ignore_errors=True)

@@ -68,6 +68,8 @@ class Handler(BaseHTTPRequestHandler):
         except storemod.WalCoverageGone as exc:
             self._error(410, str(exc), segment=exc.seg_id,
                         resume_offset=exc.resume_offset)
+        except storemod.RepairTimeout as exc:
+            self._error(503, str(exc), job_id=exc.job_id)
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, str(exc))
         except BrokenPipeError:
@@ -126,7 +128,28 @@ class Handler(BaseHTTPRequestHandler):
 
         if method == "POST" and len(parts) == 4 and parts[:2] == ["v1", "segments"] \
                 and parts[3] == "rebuild":
-            return self._send_json({"segment": s.rebuild_segment(parts[2])})
+            # Maintenance is asynchronous: enqueue a background repair job
+            # and return immediately so foreground traffic is never blocked.
+            # Same segment while a job is active -> the existing job (200).
+            job, created = s.start_repair(parts[2])
+            return self._send_json({"job": job}, status=202 if created else 200)
+
+        if method == "GET" and parts == ["v1", "repairs"]:
+            limit = _clamp_limit(q.get("limit"), 100, 1000)
+            return self._send_json({"jobs": s.list_repairs(limit=limit)})
+
+        if method == "GET" and len(parts) == 3 and parts[:2] == ["v1", "repairs"]:
+            return self._send_json({"job": s.get_repair(parts[2])})
+
+        if method == "POST" and len(parts) == 3 and parts[:2] == ["v1", "repairs"]:
+            body = self._body_json()
+            timeout = body.get("timeout", 60.0) if isinstance(body, dict) else 60.0
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                timeout = 60.0
+            timeout = max(0.0, min(timeout, 3600.0))
+            return self._send_json({"job": s.wait_repair(parts[2], timeout=timeout)})
 
         if method == "POST" and parts == ["v1", "freeze"]:
             body = self._body_json()

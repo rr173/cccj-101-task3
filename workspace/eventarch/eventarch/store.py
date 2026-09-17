@@ -26,6 +26,7 @@ import shutil
 import threading
 import time
 import uuid
+from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
 from . import segments as segmod
@@ -36,6 +37,9 @@ from .util import atomic_write_json, fsync_dir, load_json
 log = logging.getLogger("eventarch.store")
 
 OPEN = ""  # seg_id marker for entries still living in the open (unsealed) buffer
+
+# Terminal repair-job statuses.
+REPAIR_TERMINAL = ("succeeded", "failed")
 
 
 class NotFound(Exception):
@@ -55,6 +59,28 @@ class WalCoverageGone(Exception):
         super().__init__(f"WAL coverage for {seg_id} is no longer retained")
         self.seg_id = seg_id
         self.resume_offset = resume_offset
+
+
+class RepairTimeout(Exception):
+    def __init__(self, job_id: str):
+        super().__init__(f"repair job {job_id} did not finish in time")
+        self.job_id = job_id
+
+
+class _RetryRepair(Exception):
+    """Internal: abort this repair attempt and replan/retry from scratch."""
+
+
+class _RepairNoop(Exception):
+    """Internal: segment is already sealed with identical content."""
+
+
+class _RepairSuperseded(Exception):
+    """Internal: segment was restored with *other* content; do not overwrite."""
+
+
+class _RepairNotFound(Exception):
+    """Internal: segment vanished between plan and commit."""
 
 
 class Entry:
@@ -96,8 +122,11 @@ class ArchiveStore:
         self.state_dir = os.path.join(self.data_dir, "state")
         self._manifest_path = os.path.join(self.state_dir, "manifest.json")
         self._freezes_path = os.path.join(self.state_dir, "freezes.json")
+        self._repairs_path = os.path.join(self.state_dir, "repairs.json")
 
         self._lock = threading.RLock()
+        # Notified on every repair-job terminal transition (used by wait_repair).
+        self._repair_cv = threading.Condition()
         self.manifest = {"next_offset": 0, "sealed_through": -1, "segments": []}
         self._seg_by_id: Dict[str, dict] = {}
         self._devices: Dict[str, DeviceState] = {}
@@ -116,6 +145,20 @@ class ArchiveStore:
         self._janitor_stop = threading.Event()
         self._janitor: Optional[threading.Thread] = None
 
+        # ---- background repair jobs -------------------------------------
+        # Every long-running archive repair (segment rebuild) runs as a job
+        # on a bounded worker pool, doing all heavy I/O *outside* the global
+        # lock.  Only plan/commit touch shared state, and they take the lock
+        # briefly with optimistic version checks (meta["version"]).
+        self._repairs: Dict[str, dict] = {}       # job id -> job state
+        self._active_repairs: Dict[str, str] = {}  # seg_id -> job id (dedup)
+        self._repair_q: "Queue[Optional[str]]" = Queue()
+        self._repair_workers: List[threading.Thread] = []
+        self._closing = False
+        # Test/observability hook invoked OUTSIDE the lock at repair phases:
+        #   hook(job_dict, phase)  phase in {"planned", "staged"}
+        self._repair_phase_hook = None
+
     # ------------------------------------------------------------------ #
     # recovery                                                            #
     # ------------------------------------------------------------------ #
@@ -128,6 +171,15 @@ class ArchiveStore:
             self.manifest = load_json(self._manifest_path)
         self._seg_by_id = {m["id"]: m for m in self.manifest["segments"]}
         sealed_through = self.manifest.get("sealed_through", -1)
+        for meta in self.manifest["segments"]:
+            meta.setdefault("version", 1)
+
+        # 0. finish or roll back any interrupted background repair (crash
+        #    between staging, directory swap and manifest commit), load the
+        #    durable job journal, and remove directories that never reached
+        #    the manifest (orphans / stale staging dirs).  Must run BEFORE
+        #    verification so every decision is based on the reconciled files.
+        self._recover_repairs()
 
         changed = False
         # 1. verify sealed segments, load their indexes
@@ -164,11 +216,19 @@ class ArchiveStore:
                     self._mark_quarantined(meta, f"index rebuild failed: {exc2}")
                     changed = True
 
-        # 2. drop orphan segment dirs (crash between file write and manifest commit)
+        # 2. drop orphan directories: segments never committed to the
+        #    manifest, and leftover repair staging/backup directories whose
+        #    job was not journaled (or whose state is already resolved).
         for name in os.listdir(self.seg_root):
+            full = os.path.join(self.seg_root, name)
+            if not os.path.isdir(full):
+                continue
             if name.startswith("seg-") and name not in self._seg_by_id:
                 log.warning("removing orphan segment dir %s (never committed)", name)
-                shutil.rmtree(os.path.join(self.seg_root, name), ignore_errors=True)
+                shutil.rmtree(full, ignore_errors=True)
+            elif name.startswith(("stage-", "bak-")):
+                log.warning("removing stale repair dir %s", name)
+                shutil.rmtree(full, ignore_errors=True)
         fsync_dir(self.seg_root)
 
         # 3. recover WAL tail (records beyond the sealed horizon), then
@@ -206,12 +266,24 @@ class ArchiveStore:
         if os.path.exists(self._freezes_path):
             self._freezes = load_json(self._freezes_path).get("freezes", [])
 
+        # 5. resume background repairs: every non-terminal journaled job is
+        #    requeued (its work is idempotent); terminal jobs are history.
+        with self._lock:
+            for jid, job in self._repairs.items():
+                if job["status"] not in REPAIR_TERMINAL:
+                    self._update_job(jid, status="queued", error=None,
+                                     stage=None, set_attempt=1)
+                    self._active_repairs[job["seg_id"]] = jid
+                    self._repair_q.put(jid)
+        self._start_repair_workers()
+
         log.info(
             "recovery complete: %d segments (%d quarantined), %d live WAL records, "
-            "next_offset=%d, devices=%d, wal_gaps=%d",
+            "next_offset=%d, devices=%d, wal_gaps=%d, repairs_queued=%d",
             len(self.manifest["segments"]),
             sum(1 for m in self.manifest["segments"] if m["status"] == "quarantined"),
             len(live), self._next_offset, len(self._devices), len(gaps),
+            sum(1 for j in self._repairs.values() if j["status"] == "queued"),
         )
 
     def _apply_segment_index(self, seg_id: str, index: dict) -> None:
@@ -390,17 +462,20 @@ class ArchiveStore:
         """Retention horizon: WAL files with base offset below this may go.
 
         Keeps the last `wal_retain_segments` sealed segments plus anything
-        backing a quarantined segment (needed for rebuild)."""
+        backing a quarantined segment (needed for rebuild).  Segments with
+        a repair job in flight are also pinned, so that log eviction can
+        never remove the records a running job is about to stage.
+        """
         sealed = sorted(
             (m for m in self.manifest["segments"] if m["status"] == "sealed"),
             key=lambda m: m["first_offset"])
         keep_from = 0
         if len(sealed) > self.cfg.wal_retain_segments:
             keep_from = sealed[-self.cfg.wal_retain_segments]["first_offset"]
-        quarantined = [m["first_offset"] for m in self.manifest["segments"]
-                       if m["status"] == "quarantined"]
-        if quarantined:
-            keep_from = min(keep_from, min(quarantined))
+        pinned = [m["first_offset"] for m in self.manifest["segments"]
+                  if m["status"] == "quarantined" or m["id"] in self._active_repairs]
+        if pinned:
+            keep_from = min(keep_from, min(pinned))
         return keep_from
 
     def _collect_wal(self) -> None:
@@ -505,7 +580,8 @@ class ArchiveStore:
             try:
                 recs, _ = segmod.scan_records(self.seg_root, meta, from_offset)
             except segmod.SegmentCorrupt as c:
-                self.quarantine(meta["id"], c.reason)
+                self.quarantine(meta["id"], c.reason,
+                                expected_sha=meta.get("sha256"))
                 gaps.append({"segment": meta["id"], "reason": c.reason,
                              "resume_offset": c.resume_offset})
                 scanned_through = max(scanned_through, meta["last_offset"])
@@ -605,7 +681,8 @@ class ArchiveStore:
                 except segmod.SegmentCorrupt as c:
                     meta = self._seg_by_id.get(seg_id)
                     resume = (meta["last_offset"] + 1) if meta else 0
-                    self.quarantine(seg_id, c.reason)
+                    self.quarantine(seg_id, c.reason,
+                                    expected_sha=meta.get("sha256") if meta else None)
                     gaps.append({"segment": seg_id, "reason": c.reason,
                                  "resume_offset": resume})
         finally:
@@ -640,7 +717,7 @@ class ArchiveStore:
         try:
             recs, complete = segmod.scan_records(self.seg_root, meta, from_offset, limit)
         except segmod.SegmentCorrupt as c:
-            self.quarantine(seg_id, c.reason)
+            self.quarantine(seg_id, c.reason, expected_sha=meta.get("sha256"))
             raise Quarantined(seg_id, c.resume_offset, c.reason)
         return {"segment": meta, "events": recs, "complete": complete}
 
@@ -648,79 +725,719 @@ class ArchiveStore:
     # corruption handling                                                 #
     # ------------------------------------------------------------------ #
 
-    def quarantine(self, seg_id: str, reason: str) -> None:
+    def quarantine(self, seg_id: str, reason: str,
+                   expected_sha: Optional[str] = None) -> bool:
+        """Mark a sealed segment quarantined (idempotent, version-checked).
+
+        ``expected_sha`` is a stale-read guard: when given, quarantine is
+        applied only if the segment still carries that sha256.  A repair
+        job that atomically swapped in fresh bytes therefore wins the race
+        against a reader holding an old file handle.  Returns True if the
+        segment is quarantined (now or already) when this returns.
+        """
         with self._lock:
             meta = self._seg_by_id.get(seg_id)
-            if meta is None or meta["status"] == "quarantined":
-                return
-            self._mark_quarantined(meta, reason)
+            if meta is None:
+                return False
+            if meta["status"] == "quarantined":
+                return True
+            if expected_sha is not None and meta.get("sha256") != expected_sha:
+                log.info("not quarantining %s: sha256 changed "
+                         "(repaired concurrently)", seg_id)
+                return False
+            self._mark_quarantined(meta, reason, bump_version=True)
             self._persist_manifest()
             log.warning("segment %s quarantined: %s (resume at offset %d)",
                         seg_id, reason, meta["last_offset"] + 1)
+            return True
 
     @staticmethod
-    def _mark_quarantined(meta: dict, reason: str) -> None:
+    def _mark_quarantined(meta: dict, reason: str, bump_version: bool = False) -> None:
         meta["status"] = "quarantined"
         meta["quarantine_reason"] = reason
         meta["quarantined_at"] = fmt_ts(utcnow())
+        if bump_version:
+            meta["version"] = meta.get("version", 1) + 1
 
-    def rebuild_segment(self, seg_id: str) -> dict:
-        """Rebuild a quarantined segment from retained WAL records.
+    # ------------------------------------------------------------------ #
+    # background repair jobs                                               #
+    # ------------------------------------------------------------------ #
+    #
+    # A repair rebuilds one quarantined segment from retained WAL without
+    # ever holding the global lock across the heavy I/O:
+    #
+    #   plan   (lock, brief): snapshot {id, range, count, version, sha}; the
+    #          segment is also registered in _active_repairs, which pins its
+    #          WAL coverage against the janitor/eviction.
+    #   gather (no lock):  read every retained WAL file that may overlap the
+    #          range; a torn tail (concurrent rotation) or any read anomaly
+    #          -> retry the whole attempt.
+    #   stage  (no lock):  write into a unique sibling directory stage-<jid>
+    #          and verify its sha256; the LIVE file is never touched here.
+    #   commit (lock, brief, optimistic CAS on meta["version"]):
+    #          rename live -> bak-<jid>, stage -> live (atomic, so intact
+    #          files are never overwritten/truncated), install the rebuilt
+    #          index, bump/persist the manifest, then remove the backup.
+    #          Any concurrent state change of the same segment makes the CAS
+    #          fail -> the attempt rolls the directory names back and retries.
+    #
+    # Every transition is appended to the durable journal (repairs.json),
+    # so a crash mid-repair is reconciled at startup (see _recover_repairs).
 
-        The records of one segment are not necessarily in the WAL file
-        named by its first offset: a batch spanning several seal boundaries
-        is appended to the file active at ingest time, and rotation only
-        redirects *later* writes.  A file named by base B holds records
-        with offset >= B, so collect the segment's range from every
-        retained WAL file that may overlap it.
+    def rebuild_segment(self, seg_id: str, timeout: Optional[float] = 60.0) -> dict:
+        """Synchronous compatibility wrapper: enqueue a repair and block the
+        *calling* thread until it finishes (foreground traffic stays live —
+        the global lock is held only during brief plan/commit windows)."""
+        job, _created = self.start_repair(seg_id)
+        job = self.wait_repair(job["id"], timeout=timeout)
+        if job["status"] == "succeeded":
+            result = job.get("result")
+            if result is not None:
+                return result
+            with self._lock:
+                meta = self._seg_by_id.get(seg_id)
+                if meta is not None:
+                    return dict(meta)
+                raise NotFound(f"segment {seg_id} not found")
+        err = job.get("error") or {}
+        if err.get("type") == "wal_coverage_gone":
+            raise WalCoverageGone(seg_id, err.get("resume_offset", 0))
+        raise WalCoverageGone(seg_id, err.get("resume_offset", 0))
+
+    def start_repair(self, seg_id: str) -> Tuple[dict, bool]:
+        """Enqueue a background repair for one segment.
+
+        Returns (job, created).  ``created=False`` means an identical job was
+        already queued/running (idempotent dedup; the same job is returned so
+        concurrent callers never produce duplicate repair work).
         """
         with self._lock:
             meta = self._seg_by_id.get(seg_id)
             if meta is None:
                 raise NotFound(f"segment {seg_id} not found")
+            existing_id = self._active_repairs.get(seg_id)
+            if existing_id is not None:
+                return self._job_view(self._repairs[existing_id]), False
             if meta["status"] != "quarantined":
-                return dict(meta)
-            first, last = meta["first_offset"], meta["last_offset"]
-            by_offset: Dict[int, dict] = {}
-            for name in sorted(os.listdir(self.wal_dir)):
-                if not name.endswith(".wal"):
-                    continue
-                if int(name[:-4]) > last:
-                    continue  # file starts past the segment's range
-                path = os.path.join(self.wal_dir, name)
+                # Nothing to repair: record a terminal no-op job (never
+                # touches the healthy segment / its file).
+                job = self._new_job(seg_id)
+                self._finish_job_locked(
+                    job, "succeeded",
+                    result=dict(meta),
+                    detail="segment already sealed; no repair needed",
+                )
+                return self._job_view(job), True
+
+            job = self._new_job(seg_id)
+            self._active_repairs[seg_id] = job["id"]
+            self._update_job_locked(job["id"], status="queued", stage="queued")
+        self._repair_q.put(job["id"])
+        return self._job_view(job), True
+
+    def wait_repair(self, job_id: str, timeout: Optional[float] = 60.0) -> dict:
+        """Block until the job reaches a terminal state (no lock held)."""
+        with self._repair_cv:
+            ok = self._repair_cv.wait_for(
+                lambda: job_id in self._repairs
+                and self._repairs[job_id]["status"] in REPAIR_TERMINAL,
+                timeout=timeout)
+            job = self._repairs.get(job_id)
+            if not ok or job is None:
+                raise RepairTimeout(job_id)
+            return self._job_view(job)
+
+    def get_repair(self, job_id: str) -> dict:
+        with self._lock:
+            job = self._repairs.get(job_id)
+            if job is None:
+                raise NotFound(f"repair job {job_id} not found")
+            return self._job_view(job)
+
+    def list_repairs(self, limit: int = 100) -> List[dict]:
+        with self._lock:
+            jobs = sorted(self._repairs.values(),
+                          key=lambda j: j["created_at"], reverse=True)
+            return [self._job_view(j) for j in jobs[:max(1, limit)]]
+
+    # ---- job state / journal ------------------------------------------ #
+
+    def _new_job(self, seg_id: str) -> dict:
+        job = {
+            "id": f"job-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:12]}",
+            "seg_id": seg_id,
+            "status": "new",
+            "attempt": 0,
+            "stage": None,
+            "created_at": fmt_ts(utcnow()),
+            "updated_at": None,
+            "error": None,
+            "result": None,
+            "detail": None,
+        }
+        self._repairs[job["id"]] = job
+        self._persist_repairs_locked()
+        return job
+
+    @staticmethod
+    def _job_view(job: dict) -> dict:
+        view = {k: job.get(k) for k in (
+            "id", "seg_id", "status", "attempt", "stage", "created_at",
+            "updated_at", "error", "detail")}
+        if job.get("result") is not None:
+            view["result"] = job["result"]
+        return view
+
+    def _update_job_locked(self, jid: str, **fields) -> None:
+        job = self._repairs[jid]
+        if "attempt" in fields:
+            job["attempt"] = fields.pop("attempt")
+        if "set_attempt" in fields:
+            job["attempt"] = fields.pop("set_attempt")
+        if fields.pop("inc_attempt", False):
+            job["attempt"] += 1
+        for k, v in fields.items():
+            job[k] = v
+        job["updated_at"] = fmt_ts(utcnow())
+        self._persist_repairs_locked()
+
+    # convenience wrapper used from worker threads (takes the lock)
+    def _update_job(self, jid: str, **fields) -> None:
+        with self._lock:
+            self._update_job_locked(jid, **fields)
+
+    def _finish_job_locked(self, job: dict, status: str, result=None,
+                           error=None, detail=None) -> None:
+        self._active_repairs.pop(job["seg_id"], None)
+        job["status"] = status
+        job["stage"] = status
+        job["error"] = error
+        if result is not None:
+            job["result"] = result
+        if detail is not None:
+            job["detail"] = detail
+        job["updated_at"] = fmt_ts(utcnow())
+        self._persist_repairs_locked()
+        # Separate lock from the store lock: notify waiters without
+        # re-ordering locking; a waiter's predicate reads plain dicts under
+        # the condition's own lock after this memory-visible transition.
+        with self._repair_cv:
+            self._repair_cv.notify_all()
+
+    def _persist_repairs_locked(self) -> None:
+        # Bound journal growth: keep all non-terminal jobs plus the newest N
+        # terminal ones; active jobs are never pruned.
+        active = [j for j in self._repairs.values()
+                  if j["status"] not in REPAIR_TERMINAL]
+        done = sorted(
+            (j for j in self._repairs.values()
+             if j["status"] in REPAIR_TERMINAL),
+            key=lambda j: j["updated_at"] or "", reverse=True)
+        keep = active + done[:max(0, self.cfg.repair_history)]
+        keep.sort(key=lambda j: j["created_at"])
+        # self._repairs itself keeps in-memory history as written so far;
+        # only the durable file is truncated.
+        atomic_write_json(self._repairs_path, {"repairs": keep})
+
+    # ---- worker pool --------------------------------------------------- #
+
+    def _start_repair_workers(self) -> None:
+        n = max(1, self.cfg.repair_workers)
+        for i in range(n):
+            t = threading.Thread(target=self._repair_worker_loop,
+                                 name=f"repair-{i}", daemon=True)
+            t.start()
+            self._repair_workers.append(t)
+
+    def _repair_worker_loop(self) -> None:
+        while True:
+            jid = self._repair_q.get()
+            if jid is None:
+                self._repair_q.task_done()
+                return
+            try:
+                self._run_repair(jid)
+            except Exception:
+                log.exception("repair worker crashed running %s", jid)
+                with self._lock:
+                    job = self._repairs.get(jid)
+                    if job is not None and job["status"] not in REPAIR_TERMINAL:
+                        self._finish_job_locked(
+                            job, "failed",
+                            error={"type": "internal", "reason": "worker exception"})
+            finally:
+                self._repair_q.task_done()
+
+    # ---- per-job state machine ---------------------------------------- #
+
+    def _run_repair(self, jid: str) -> None:
+        with self._lock:
+            job = self._repairs.get(jid)
+            if job is None or job["status"] in REPAIR_TERMINAL:
+                return
+            self._update_job_locked(jid, status="running", stage="planning")
+        max_attempts = max(1, self.cfg.repair_max_attempts)
+
+        while True:
+            if self._janitor_stop.is_set():
+                if self._park_for_shutdown(jid):
+                    return
+                # job already reached a terminal state; nothing more to do
+            with self._lock:
+                j = self._repairs.get(jid)
+                if j is None:
+                    return
+                if j["attempt"] >= max_attempts:
+                    self._finish_job_locked(j, "failed", error=j.get("error") or {
+                        "type": "max_attempts",
+                        "reason": "repair attempts exhausted"})
+                    return
+                self._update_job_locked(jid, inc_attempt=True)
+                meta = self._seg_by_id.get(j["seg_id"])
+                if meta is None:
+                    self._finish_job_locked(j, "failed", error={
+                        "type": "not_found", "reason": "segment vanished"})
+                    return
+                plan = {
+                    "seg_id": meta["id"],
+                    "first": meta["first_offset"],
+                    "last": meta["last_offset"],
+                    "count": meta["count"],
+                    "version": meta.get("version", 1),
+                    "old_sha": meta.get("sha256"),
+                }
+                attempt = j["attempt"]
+            self._fire_hook(j, "planned")
+
+            try:
+                # Heavy I/O outside the lock.
+                with self._lock:
+                    self._update_job_locked(jid, stage="gathering_wal")
+                records = self._gather_wal_records(jid, plan)
+
+                stage_root = os.path.join(self.seg_root, f"stage-{jid}-{attempt}")
+                stage_seg = os.path.join(stage_root, plan["seg_id"])
+                bak_dir = os.path.join(self.seg_root, f"bak-{jid}-{attempt}")
+                shutil.rmtree(stage_root, ignore_errors=True)
+                with self._lock:
+                    self._update_job_locked(jid, stage="staging")
+                new_meta, index = segmod.write_segment_dir(
+                    stage_seg, plan["seg_id"], records)
+                # Self-check before publishing: identity must match the plan.
+                if (new_meta["first_offset"] != plan["first"]
+                        or new_meta["last_offset"] != plan["last"]
+                        or new_meta["count"] != plan["count"]):
+                    raise _RetryRepair("staged segment identity mismatch")
+                ok, why = segmod.verify_file(
+                    segmod.events_path(stage_root, plan["seg_id"]),
+                    new_meta["sha256"])
+                if not ok:
+                    raise _RetryRepair(f"staged segment verification failed: {why}")
+                self._fire_hook(j, "staged")
+
+                if self._janitor_stop.is_set():
+                    self._rollback_attempt(jid, attempt)
+                    self._park_for_shutdown(jid)
+                    return
+                with self._lock:
+                    self._update_job_locked(jid, stage="committing")
+                    self._commit_repair(j, plan, new_meta, index,
+                                        stage_root, bak_dir)
+                return  # terminal transition happened inside _commit_repair
+
+            except _RepairNoop:
+                with self._lock:
+                    j = self._repairs.get(jid)
+                    if j is not None and j["status"] not in REPAIR_TERMINAL:
+                        self._finish_job_locked(j, "succeeded",
+                                                result=None,
+                                                detail="segment already sealed; "
+                                                       "no repair needed")
+                return
+            except _RepairSuperseded:
+                with self._lock:
+                    j = self._repairs.get(jid)
+                    if j is not None and j["status"] not in REPAIR_TERMINAL:
+                        self._finish_job_locked(j, "succeeded",
+                                                result=None,
+                                                detail="segment was repaired with "
+                                                       "other content concurrently")
+                return
+            except _RepairNotFound:
+                with self._lock:
+                    j = self._repairs.get(jid)
+                    if j is not None and j["status"] not in REPAIR_TERMINAL:
+                        self._finish_job_locked(j, "failed", error={
+                            "type": "not_found",
+                            "reason": "segment vanished during repair"})
+                return
+            except WalCoverageGone as exc:
+                # Definitive: WAL no longer covers the segment; keep it
+                # quarantined and surface the resume position (no retries).
+                with self._lock:
+                    j = self._repairs.get(jid)
+                    if j is not None and j["status"] not in REPAIR_TERMINAL:
+                        self._finish_job_locked(j, "failed", error={
+                            "type": "wal_coverage_gone",
+                            "reason": "retained WAL does not cover the segment",
+                            "resume_offset": exc.resume_offset})
+                return
+            except (_RetryRepair, OSError, ValueError, KeyError,
+                    segmod.SegmentCorrupt, walmod.TornTail,
+                    walmod.FrameCorrupt) as exc:
+                # Transient: concurrent WAL rotation/torn read, directory
+                # race, or a version conflict detected at commit.  Roll back
+                # filesystem leftovers and replan from current state.
+                self._rollback_attempt(jid, attempt)
+                with self._lock:
+                    j = self._repairs.get(jid)
+                    if j is None or j["status"] in REPAIR_TERMINAL:
+                        return
+                    if j["attempt"] >= max_attempts:
+                        self._finish_job_locked(j, "failed", error={
+                            "type": "conflict",
+                            "reason": f"repair gave up after {j['attempt']} "
+                                      f"attempts: {exc}"})
+                        return
+                    self._update_job_locked(jid, status="running",
+                                            stage="retrying",
+                                            error={"type": "retry",
+                                                   "reason": str(exc)})
+                log.info("repair %s attempt %d failed (%s); retrying",
+                         jid, attempt, exc)
+                self._sleep_backoff(attempt)
+                # loop: replan under the lock (fresh version/state snapshot)
+
+    def _sleep_backoff(self, attempt: int) -> None:
+        self._janitor_stop.wait(self.cfg.repair_retry_backoff_sec * attempt)
+
+    def _park_for_shutdown(self, jid: str) -> bool:
+        """Return a non-terminal job to the durable queue during shutdown.
+
+        Jobs parked this way are requeued by the next process (the work is
+        idempotent); marking them terminal would drop acknowledged repair
+        intent.  Returns True if this thread should stop running the job.
+        """
+        with self._lock:
+            j = self._repairs.get(jid)
+            if j is None or j["status"] in REPAIR_TERMINAL:
+                return False
+            j["status"] = "queued"
+            j["stage"] = "queued"
+            j["error"] = None
+            j["updated_at"] = fmt_ts(utcnow())
+            self._persist_repairs_locked()
+            with self._repair_cv:
+                self._repair_cv.notify_all()
+        return True
+
+    def _fire_hook(self, jid_or_job: object, phase: str) -> None:
+        hook = self._repair_phase_hook
+        if hook is None:
+            return
+        if isinstance(jid_or_job, str):
+            with self._lock:
+                job = self._repairs.get(jid_or_job)
+                view = self._job_view(job) if job else None
+        else:
+            view = jid_or_job
+        if view is not None:
+            try:
+                hook(view, phase)
+            except Exception:
+                log.exception("repair phase hook raised")
+
+    def _gather_wal_records(self, jid: str, plan: dict) -> List[dict]:
+        """Collect the segment's exact offset range from retained WAL files.
+
+        Mirrors rebuild_segment's range rule (records may live in files not
+        named after this segment's first offset).  All file I/O happens
+        outside the global lock; any torn/corrupt frame (e.g. reading the
+        active WAL across a concurrent rotate) raises _RetryRepair.
+        """
+        first, last = plan["first"], plan["last"]
+        by_offset: Dict[int, dict] = {}
+        for name in sorted(os.listdir(self.wal_dir)):
+            if not name.endswith(".wal"):
+                continue
+            try:
+                base = int(name[:-4])
+            except ValueError:
+                continue
+            if base > last:
+                continue  # file starts past the segment's range
+            path = os.path.join(self.wal_dir, name)
+            try:
+                payloads = walmod.read_all_payloads(path)
+            except (OSError, walmod.TornTail, walmod.FrameCorrupt) as exc:
+                # Might be the live WAL file being rotated concurrently;
+                # the whole attempt is idempotent, so retry.
+                raise _RetryRepair(f"WAL file {name} unreadable: {exc}")
+            for payload in payloads:
                 try:
-                    payloads = walmod.read_all_payloads(path)
-                except Exception as exc:
-                    log.warning("rebuild %s: skipping unreadable WAL file %s: %s",
-                                seg_id, name, exc)
-                    continue
-                for payload in payloads:
                     rec = json.loads(payload)
-                    if first <= rec["offset"] <= last:
-                        by_offset.setdefault(rec["offset"], rec)
-            # keys of by_offset are a subset of [first..last], so a full
-            # count means the range is covered contiguously
-            if len(by_offset) != meta["count"] or \
-                    len(by_offset) != last - first + 1:
-                raise WalCoverageGone(seg_id, last + 1)
-            records = [by_offset[o] for o in range(first, last + 1)]
-            new_meta, index = segmod.write_segment(self.seg_root, seg_id, records)
+                except ValueError as exc:
+                    raise _RetryRepair(f"WAL file {name} undecodable: {exc}")
+                if first <= rec["offset"] <= last:
+                    by_offset.setdefault(rec["offset"], rec)
+
+        if len(by_offset) != plan["count"] or len(by_offset) != last - first + 1:
+            raise WalCoverageGone(plan["seg_id"], last + 1)
+        return [by_offset[o] for o in range(first, last + 1)]
+
+    def _commit_repair(self, job: dict, plan: dict, new_meta: dict, index: dict,
+                       stage_root: str, bak_dir: str) -> None:
+        """Publish a staged rebuild (caller HOLDS the lock).
+
+        Optimistic CAS on the planned version: any intervening state change
+        of the same segment (rebuild, re-quarantine) aborts this attempt so
+        stale bytes can never win.  Directory swap is two renames and thus
+        never truncates/overwrites an intact live file in place.
+        """
+        seg_id = plan["seg_id"]
+        stage_seg = os.path.join(stage_root, seg_id)
+        meta = self._seg_by_id.get(seg_id)
+        if meta is None:
+            raise _RepairNotFound()
+        if meta.get("version", 1) != plan["version"]:
+            if meta["status"] == "sealed" and meta.get("sha256") == new_meta["sha256"]:
+                raise _RepairNoop()
+            if meta["status"] == "sealed":
+                raise _RepairSuperseded()
+            # Re-quarantined (new sha256/version): conflict -> retry/replan.
+            raise _RetryRepair(
+                f"segment version changed {plan['version']} -> {meta.get('version')}")
+
+        live_dir = segmod.seg_dir(self.seg_root, seg_id)
+        swapped = False
+        try:
+            # 1. atomic swap: live aside, staged into place.
+            if os.path.exists(bak_dir):
+                shutil.rmtree(bak_dir, ignore_errors=True)
+            os.rename(live_dir, bak_dir)
+            try:
+                os.rename(stage_seg, live_dir)
+            except OSError:
+                # Undo the first rename so the segment is never missing;
+                # the attempt is then retried from scratch.
+                if not os.path.exists(live_dir) and os.path.exists(bak_dir):
+                    os.rename(bak_dir, live_dir)
+                raise
+            swapped = True
+            fsync_dir(self.seg_root)
+            shutil.rmtree(stage_root, ignore_errors=True)
+
+            # 2. commit point: manifest now points at the rebuilt bytes.
+            preserved_created = meta.get("created_at")
             meta.clear()
-            meta.update(new_meta)  # status=sealed, fresh sha256
+            meta.update(new_meta)
+            if preserved_created is not None:
+                meta["created_at"] = preserved_created
+            meta["version"] = plan["version"] + 1
+            try:
+                self._persist_manifest()
+            except OSError:
+                # Swap landed but the commit is not durable.  Reverse the
+                # swap in-process; startup reconciliation is the backstop if
+                # this process dies during the reversal.
+                if os.path.isdir(bak_dir):
+                    shutil.rmtree(live_dir, ignore_errors=True)
+                    os.rename(bak_dir, live_dir)
+                    fsync_dir(self.seg_root)
+                    swapped = False
+                raise
+
+            # 3. swap the in-memory device index for this segment.
+            self._install_segment_index(seg_id, index)
+
+            # 4. remove the quarantined backup (its bytes were corrupt).
+            shutil.rmtree(bak_dir, ignore_errors=True)
+        except OSError as exc:
+            if swapped and os.path.isdir(bak_dir):
+                # Defensive: still carrying the backup -> restore old live.
+                try:
+                    shutil.rmtree(live_dir, ignore_errors=True)
+                    os.rename(bak_dir, live_dir)
+                    fsync_dir(self.seg_root)
+                except OSError:
+                    pass
+            # Filesystem state was rolled back (or reconciled on restart);
+            # retry the whole attempt.
+            raise _RetryRepair(f"commit swap failed: {exc}")
+
+        result = dict(meta)
+        self._finish_job_locked(job, "succeeded", result=result,
+                                detail="rebuilt from retained WAL")
+        log.info("segment %s rebuilt by %s (version -> %d, %d records)",
+                 seg_id, job["id"], meta["version"], meta["count"])
+
+    def _install_segment_index(self, seg_id: str, index: dict) -> None:
+        """Replace device entries belonging to seg_id from a rebuilt index."""
+        for dev_id, d in index["devices"].items():
+            dev = self._devices.setdefault(dev_id, DeviceState())
+            dev.entries = [e for e in dev.entries if e.seg_id != seg_id]
+            for ie in d["entries"]:
+                bisect.insort(dev.entries, Entry(
+                    ie["seq"], ie["offset"], seg_id, ie["pos"], ie["len"],
+                    ie["event_id"], parse_ts(ie["device_ts"])), key=_entry_key)
+                dev.event_ids[ie["event_id"]] = ie["offset"]
+                dev.seqs.add(ie["seq"])
+            self._refresh_device_extremes(dev)
+
+    def _rollback_attempt(self, jid: str, attempt: int) -> None:
+        """Best-effort removal of a failed attempt's stage/bak directories."""
+        for d in (os.path.join(self.seg_root, f"stage-{jid}-{attempt}"),
+                  os.path.join(self.seg_root, f"bak-{jid}-{attempt}")):
+            try:
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                log.warning("could not clean up repair dir %s", d)
+        # If a crash (not an in-process exception) leaves a swap half-done,
+        # startup reconciliation is the authority — see _recover_repairs().
+
+    # ---- crash recovery ------------------------------------------------ #
+
+    def _recover_repairs(self) -> None:
+        """Reconcile repair directories and the durable job journal.
+
+        On-disk protocol per attempt (directories live next to segments):
+          stage-<jid>-<n>/<seg-id>/   freshly written candidate
+          seg-<off>/                  live (committed manifest points here)
+          bak-<jid>-<n>/<seg-id>/     previous live moved aside; it exists
+                                      only between the two renames and the
+                                      manifest commit.
+
+        Crash windows:
+          * before renames: stage-* present, live intact       -> drop stage
+          * live->bak only (stage->live missed): bak present,
+            live absent, stage present                          -> decide by
+            job status: commit (succeeded) or roll back (else)
+          * both renames, manifest missed: bak present, live is
+            the rebuilt bytes, stage gone                      -> adopt when
+            it verifies (succeeded) else restore bak
+          * manifest committed (commit point), bak removal missed:
+            bak present, live verifies                         -> drop bak
+        """
+        jobs: Dict[str, dict] = {}
+        if os.path.exists(self._repairs_path):
+            try:
+                for j in load_json(self._repairs_path).get("repairs", []):
+                    jobs[j["id"]] = j
+            except Exception as exc:
+                log.error("cannot read repair journal (%s); starting empty", exc)
+
+        # jid -> directory (take one even if several attempts remain).
+        # Names are stage-<jid>-<attempt> / bak-<jid>-<attempt> and jid
+        # itself contains hyphens ("job-<ts>-<hex>"), so strip the prefix
+        # and drop the trailing attempt number.
+        def parse(name: str, prefix: str) -> str:
+            return name[len(prefix):].rsplit("-", 1)[0]
+
+        stage_map: Dict[str, str] = {}
+        bak_map: Dict[str, str] = {}
+        for name in os.listdir(self.seg_root):
+            full = os.path.join(self.seg_root, name)
+            if not os.path.isdir(full):
+                continue
+            if name.startswith("stage-"):
+                stage_map.setdefault(parse(name, "stage-"), full)
+            elif name.startswith("bak-"):
+                bak_map.setdefault(parse(name, "bak-"), full)
+
+        manifest_changed = False
+        for jid, job in jobs.items():
+            stage_root = stage_map.pop(jid, None)
+            bak_root = bak_map.pop(jid, None)
+            seg_id = job["seg_id"]
+            live_dir = segmod.seg_dir(self.seg_root, seg_id)
+            stage_seg = os.path.join(stage_root, seg_id) if stage_root else None
+            bak_seg = os.path.join(bak_root, seg_id) if bak_root else None
+            succeeded = job.get("status") == "succeeded"
+            new_sha = (job.get("result") or {}).get("sha256")
+            try:
+                # Case 1: live moved aside (and maybe stage moved in).
+                if bak_seg is not None and os.path.isdir(bak_seg):
+                    live_is_new = (
+                        os.path.isdir(live_dir) and new_sha is not None
+                        and segmod.verify_file(
+                            segmod.events_path(self.seg_root, seg_id),
+                            new_sha)[0])
+                    if succeeded and live_is_new:
+                        # Both renames landed; manifest commit is checked below.
+                        shutil.rmtree(bak_root, ignore_errors=True)
+                        bak_seg = None
+                    elif succeeded and stage_seg is not None and os.path.isdir(stage_seg):
+                        # live->bak done, stage->live missed: finish the swap.
+                        shutil.rmtree(live_dir, ignore_errors=True)
+                        os.rename(stage_seg, live_dir)
+                        shutil.rmtree(bak_root, ignore_errors=True)
+                        shutil.rmtree(stage_root, ignore_errors=True)
+                        stage_seg = bak_seg = None
+                        fsync_dir(self.seg_root)
+                        live_is_new = True
+                    else:
+                        # Non-terminal/failed job OR unverifiable candidate:
+                        # restore the pre-repair bytes.
+                        shutil.rmtree(live_dir, ignore_errors=True)
+                        os.rename(bak_seg, live_dir)
+                        shutil.rmtree(bak_root, ignore_errors=True)
+                        fsync_dir(self.seg_root)
+                        log.warning("repair %s rolled back at startup", jid)
+                        bak_seg = None
+                    # Align the manifest with adopted bytes when the swap won.
+                    if succeeded and live_is_new:
+                        meta = self._seg_by_id.get(seg_id)
+                        result = job.get("result") or {}
+                        if meta is not None and meta.get("sha256") != result.get("sha256"):
+                            preserved = meta.get("created_at")
+                            meta.clear()
+                            meta.update(result)
+                            if preserved is not None:
+                                meta["created_at"] = preserved
+                            meta["version"] = max(meta.get("version", 1),
+                                                  result.get("version", 1))
+                            manifest_changed = True
+
+                # Case 2: staged but never moved -> adopt only for a
+                # journaled success, otherwise discard.
+                if stage_seg is not None and os.path.isdir(stage_seg):
+                    if succeeded and new_sha is not None and segmod.verify_file(
+                            segmod.events_path(stage_root, seg_id), new_sha)[0] \
+                            and not os.path.isdir(live_dir):
+                        os.rename(stage_seg, live_dir)
+                        fsync_dir(self.seg_root)
+                        meta = self._seg_by_id.get(seg_id)
+                        result = job.get("result") or {}
+                        if meta is not None:
+                            preserved = meta.get("created_at")
+                            meta.clear()
+                            meta.update(result)
+                            if preserved is not None:
+                                meta["created_at"] = preserved
+                            manifest_changed = True
+                    shutil.rmtree(stage_root, ignore_errors=True)
+
+                # A non-terminal job survives the crash: run it again.
+                if job.get("status") not in REPAIR_TERMINAL:
+                    job["status"] = "queued"
+                    job["stage"] = "queued"
+                    job["error"] = None
+                    job["attempt"] = 0
+                    job["updated_at"] = fmt_ts(utcnow())
+            except OSError as exc:
+                log.error("repair reconciliation error for %s: %s", jid, exc)
+                if job.get("status") not in REPAIR_TERMINAL:
+                    job["status"] = "queued"
+                    job["updated_at"] = fmt_ts(utcnow())
+            job["updated_at"] = fmt_ts(utcnow())
+
+        # Unclaimed stage/bak directories (no matching journaled job) are
+        # removed by the generic orphan sweep in open().
+        self._repairs = jobs
+        if manifest_changed:
             self._persist_manifest()
-            # refresh device entries for this segment from the rebuilt index
-            for dev_id, d in index["devices"].items():
-                dev = self._devices.setdefault(dev_id, DeviceState())
-                dev.entries = [e for e in dev.entries if e.seg_id != seg_id]
-                for ie in d["entries"]:
-                    bisect.insort(dev.entries, Entry(
-                        ie["seq"], ie["offset"], seg_id, ie["pos"], ie["len"],
-                        ie["event_id"], parse_ts(ie["device_ts"])), key=_entry_key)
-                    dev.event_ids[ie["event_id"]] = ie["offset"]
-                    dev.seqs.add(ie["seq"])
-                self._refresh_device_extremes(dev)
-            log.info("segment %s rebuilt from WAL (%d records)", seg_id, len(records))
-            return dict(meta)
+        self._persist_repairs_locked()
 
     # ------------------------------------------------------------------ #
     # stats / lifecycle                                                   #
@@ -747,6 +1464,15 @@ class ArchiveStore:
                     "gaps": list(self._wal_gaps),
                 },
                 "freezes": len(self._freezes),
+                "repairs": {
+                    "active": len(self._active_repairs),
+                    "queued": sum(1 for j in self._repairs.values()
+                                  if j["status"] in ("new", "queued", "running")),
+                    "succeeded": sum(1 for j in self._repairs.values()
+                                     if j["status"] == "succeeded"),
+                    "failed": sum(1 for j in self._repairs.values()
+                                  if j["status"] == "failed"),
+                },
                 "config": {
                     "segment_max_records": self.cfg.segment_max_records,
                     "segment_max_age_sec": self.cfg.segment_max_age_sec,
@@ -785,9 +1511,20 @@ class ArchiveStore:
         self._janitor_stop.set()
         if self._janitor:
             self._janitor.join(timeout=5)
+        # Drain repair workers: queued/in-flight jobs remain journaled and
+        # are requeued at the next startup.
+        with self._lock:
+            self._closing = True
+        for _ in self._repair_workers:
+            self._repair_q.put(None)
+        for t in self._repair_workers:
+            t.join(timeout=5)
         with self._lock:
             if self._wal is not None:
                 self._wal.close()
+        # Wake any synchronous waiters whose job is not going to finish now.
+        with self._repair_cv:
+            self._repair_cv.notify_all()
 
     # ------------------------------------------------------------------ #
     # persistence helpers                                                 #

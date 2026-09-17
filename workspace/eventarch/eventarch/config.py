@@ -17,6 +17,10 @@ class Config:
     fsync: bool = True                     # set EA_FSYNC=0 only for benchmarks
     janitor_interval_sec: float = 1.0
     max_batch: int = 1000
+    repair_workers: int = 2               # background repair-job concurrency
+    repair_max_attempts: int = 5          # version-conflict / torn-WAL retries
+    repair_retry_backoff_sec: float = 0.1
+    repair_history: int = 100             # finished jobs retained in the journal
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -36,4 +40,9 @@ class Config:
             fsync=env("EA_FSYNC", "1", str).lower() not in ("0", "false", "no"),
             janitor_interval_sec=env("EA_JANITOR_INTERVAL_SEC", cls.janitor_interval_sec, float),
             max_batch=env("EA_MAX_BATCH", cls.max_batch, int),
+            repair_workers=env("EA_REPAIR_WORKERS", cls.repair_workers, int),
+            repair_max_attempts=env("EA_REPAIR_MAX_ATTEMPTS", cls.repair_max_attempts, int),
+            repair_retry_backoff_sec=env("EA_REPAIR_RETRY_BACKOFF_SEC",
+                                         cls.repair_retry_backoff_sec, float),
+            repair_history=env("EA_REPAIR_HISTORY", cls.repair_history, int),
         )

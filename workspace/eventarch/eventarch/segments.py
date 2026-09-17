@@ -43,12 +43,23 @@ def events_path(seg_root: str, seg_id: str) -> str:
 
 
 def write_segment(seg_root: str, seg_id: str, records: List[dict]) -> Tuple[dict, dict]:
-    """Write events.log + index.json + meta.json atomically-ish (fsynced).
+    """Write a sealed segment into its live directory.
 
-    Returns (meta, index).  The segment becomes visible only when the caller
-    commits it to the manifest afterwards.
+    Callers repairing an existing (quarantined) segment MUST NOT use this:
+    it writes the live path in place.  Use write_segment_dir() with a
+    separate staging directory and publish via an atomic directory swap.
     """
-    d = seg_dir(seg_root, seg_id)
+    return write_segment_dir(seg_dir(seg_root, seg_id), seg_id, records)
+
+
+def write_segment_dir(d: str, seg_id: str, records: List[dict]) -> Tuple[dict, dict]:
+    """Write events.log + index.json + meta.json into directory `d`.
+
+    The directory is created if needed; it must not be a live segment
+    directory (repairs stage into a unique .stage-* directory first).
+    Returns (meta, index).  The segment becomes visible only when the
+    caller atomically swaps the directory and commits the manifest.
+    """
     os.makedirs(d, exist_ok=True)
 
     sha = hashlib.sha256()
@@ -90,6 +101,7 @@ def write_segment(seg_root: str, seg_id: str, records: List[dict]) -> Tuple[dict
         "count": len(records),
         "sha256": sha.hexdigest(),
         "status": "sealed",
+        "version": 1,
         "min_ingest_ts": records[0]["ingest_ts"],
         "max_ingest_ts": records[-1]["ingest_ts"],
         "created_at": fmt_ts(utcnow()),
@@ -108,11 +120,18 @@ def verify(seg_root: str, meta: dict) -> Tuple[bool, str]:
     path = events_path(seg_root, meta["id"])
     if not os.path.exists(path):
         return False, "events.log missing"
+    return verify_file(path, meta.get("sha256"))
+
+
+def verify_file(path: str, expected_sha: Optional[str]) -> Tuple[bool, str]:
+    """Verify a single events.log file (live or staged) against a sha256."""
+    if not os.path.exists(path):
+        return False, "events.log missing"
     sha = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             sha.update(chunk)
-    if sha.hexdigest() != meta.get("sha256"):
+    if sha.hexdigest() != expected_sha:
         return False, "events.log sha256 mismatch"
     return True, ""
 
