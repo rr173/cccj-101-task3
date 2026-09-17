@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.git/
+data/
+tests/
+scripts/
+*.md
+docker-compose.yml
+Makefile

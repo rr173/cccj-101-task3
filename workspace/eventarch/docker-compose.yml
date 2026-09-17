@@ -1,0 +1,18 @@
+services:
+  eventarch:
+    build: .
+    image: eventarch:0.1.0
+    ports:
+      - "8080:8080"
+    volumes:
+      - eventarch-data:/data
+    environment:
+      EA_SEGMENT_MAX_RECORDS: "1000"   # seal a segment after N events
+      EA_SEGMENT_MAX_AGE_SEC: "300"    # ... or after N seconds
+      EA_LATE_THRESHOLD_SEC: "900"     # device_ts older than this -> "late"
+      EA_WAL_RETAIN_SEGMENTS: "8"      # sealed segments rebuildable from WAL
+      EA_FSYNC: "1"                    # 0 only for benchmarks (unsafe)
+    restart: unless-stopped
+
+volumes:
+  eventarch-data:
